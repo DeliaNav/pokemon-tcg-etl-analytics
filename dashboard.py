@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from src.analytics import (
     get_market_kpis,
+    get_gold_set_summary,
     get_median_price_by_set,
     get_top_anomalies,
     get_vintage_vs_modern_evolution,
@@ -25,7 +26,8 @@ from src.analytics import (
     get_top_artists_by_market_value,
     get_full_cards_dataset,
     execute_custom_query,
-    DEFAULT_DB_PATH
+    DEFAULT_DB_PATH,
+    DEFAULT_PARQUET_PATH
 )
 from run_pipeline import run_pipeline
 
@@ -262,12 +264,47 @@ def render_metric_card(label: str, value: str, subtext: str = ""):
     """
 
 
+@st.cache_data(ttl=300)
+def cached_market_kpis(db_path: str = DEFAULT_DB_PATH):
+    return get_market_kpis(db_path=db_path)
+
+
+@st.cache_data(ttl=300)
+def cached_gold_set_summary(db_path: str = DEFAULT_DB_PATH):
+    return get_gold_set_summary(db_path=db_path)
+
+
+@st.cache_data(ttl=300)
+def cached_median_price_by_set(db_path: str = DEFAULT_DB_PATH):
+    return get_median_price_by_set(db_path=db_path)
+
+
+@st.cache_data(ttl=300)
+def cached_top_anomalies(db_path: str = DEFAULT_DB_PATH, limit: int = 120):
+    return get_top_anomalies(db_path=db_path, limit=limit)
+
+
+@st.cache_data(ttl=300)
+def cached_vintage_vs_modern(db_path: str = DEFAULT_DB_PATH):
+    return get_vintage_vs_modern_evolution(db_path=db_path)
+
+
+@st.cache_data(ttl=300)
+def cached_top_artists(db_path: str = DEFAULT_DB_PATH, min_cards: int = 5, limit: int = 10):
+    return get_top_artists_by_market_value(db_path=db_path, min_cards=min_cards, limit=limit)
+
+
+@st.cache_data(ttl=300)
+def cached_full_cards(db_path: str = DEFAULT_DB_PATH, parquet_path: str = DEFAULT_PARQUET_PATH):
+    return get_full_cards_dataset(db_path=db_path, parquet_path=parquet_path)
+
+
 def verify_database_exists() -> bool:
-    """Verifica si la base de datos DuckDB existe y contiene registros."""
+    """Verifica si el warehouse DuckDB existe y contiene registros en silver_cards."""
     if not os.path.exists(DEFAULT_DB_PATH):
         return False
     try:
-        kpis = get_market_kpis(DEFAULT_DB_PATH)
+        kpis = cached_market_kpis(DEFAULT_DB_PATH)
         return kpis.get("total_cards", 0) > 0
     except Exception:
         return False
@@ -289,19 +326,20 @@ def render_sidebar():
 
         st.markdown('<div class="section-heading">Arquitectura del Sistema</div>', unsafe_allow_html=True)
         st.markdown("""
-        - Almacén: `DuckDB (Esquema Estrella)`
-        - Procesamiento: `Pandas / NumPy`
+        - Bronze: `data/raw/ (CSVs)`
+        - Silver: `cards_clean.parquet`
+        - Gold: `DuckDB (gold_set_summary)`
         - Detección de atípicos: `MAD & IQR`
-        - Consultas: `SQL Vectorizado`
         """)
 
         st.markdown('<div style="height: 10px;"></div>', unsafe_allow_html=True)
         st.markdown('<div class="section-heading">Control del Pipeline</div>', unsafe_allow_html=True)
         
         if st.button("Ejecutar Pipeline ETL", use_container_width=True):
-            with st.spinner("Ejecutando pipeline ETL..."):
+            with st.spinner("Ejecutando pipeline ETL (Bronze -> Silver -> Gold)..."):
                 t0 = time.time()
                 run_pipeline()
+                st.cache_data.clear()
                 elapsed = time.time() - t0
                 st.success(f"Pipeline ejecutado en {elapsed:.2f}s")
                 st.rerun()
@@ -332,19 +370,20 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Validar que exista la base de datos DuckDB
+    # Validar que exista el warehouse DuckDB
     if not verify_database_exists():
-        st.warning("No se encontró el almacén analítico DuckDB en 'data/pokemon_market.duckdb'.")
+        st.warning("No se encontró el almacén analítico DuckDB en 'data/warehouse/pokemon_tcg.duckdb'.")
         if st.button("Inicializar Almacén DuckDB y Ejecutar Pipeline", type="primary"):
-            with st.spinner("Procesando datos y construyendo esquema estrella..."):
+            with st.spinner("Procesando capas Bronze -> Silver (Parquet) -> Gold (DuckDB)..."):
                 run_pipeline()
+                st.cache_data.clear()
                 st.success("Almacén analítico inicializado exitosamente.")
                 st.rerun()
         st.stop()
 
-    # Cargar métricas agregadas
+    # Cargar métricas agregadas con caché
     try:
-        kpis = get_market_kpis(DEFAULT_DB_PATH)
+        kpis = cached_market_kpis(DEFAULT_DB_PATH)
     except Exception as e:
         st.error(f"Error al conectar con la base de datos DuckDB: {e}")
         st.stop()
@@ -398,7 +437,7 @@ def main():
 
         with col_left:
             st.markdown('<div class="section-heading">Precio Mediano por Era Histórica (USD)</div>', unsafe_allow_html=True)
-            df_era = get_vintage_vs_modern_evolution(DEFAULT_DB_PATH)
+            df_era = cached_vintage_vs_modern(DEFAULT_DB_PATH)
 
             # Bar chart editorial: Gris pizarra con destaque en Vintage
             colors_era = [
@@ -423,7 +462,7 @@ def main():
 
         with col_right:
             st.markdown('<div class="section-heading">Top 10 Expansiones por Precio Mediano (USD)</div>', unsafe_allow_html=True)
-            df_sets = get_median_price_by_set(DEFAULT_DB_PATH).head(10)
+            df_sets = cached_median_price_by_set(DEFAULT_DB_PATH).head(10)
 
             # Bar horizontal: Gris pizarra con el set líder resaltado en acento
             colors_sets = [COLOR_ACCENT if i == 0 else COLOR_BASE for i in range(len(df_sets))]
@@ -441,7 +480,12 @@ def main():
                 ]
             )
             apply_editorial_theme(fig_top_sets, height=340)
-            fig_top_sets.update_layout(yaxis=dict(autorange="reversed"))
+            #fig_top_sets.update_layout(yaxis=dict(autorange="reversed"))
+            max_val = df_sets["median_market_price"].max()
+            fig_top_sets.update_layout(
+                yaxis=dict(autorange="reversed"),
+                xaxis=dict(range=[0, max_val * 1.22]),
+            )
             st.plotly_chart(fig_top_sets, use_container_width=True, config={"displayModeBar": False})
 
         # Panel de activo líder
@@ -463,11 +507,11 @@ def main():
         """, unsafe_allow_html=True)
 
     # =========================================================================
-    # TAB 2: EXPANSIONES Y SERIES
+    # TAB 2: EXPANSIONES Y SERIES (GOLD SET SUMMARY)
     # =========================================================================
     with tab_sets:
-        st.markdown('<div class="section-heading">Evolución Temporal de Precios por Expansión</div>', unsafe_allow_html=True)
-        df_all_sets = get_median_price_by_set(DEFAULT_DB_PATH)
+        st.markdown('<div class="section-heading">Comparativa de Expansiones (Capa Gold: gold_set_summary)</div>', unsafe_allow_html=True)
+        df_all_sets = cached_gold_set_summary(DEFAULT_DB_PATH)
 
         f_col1, f_col2 = st.columns([1, 2])
         with f_col1:
@@ -495,10 +539,10 @@ def main():
             data=[
                 go.Scatter(
                     x=filtered_sets["release_date"],
-                    y=filtered_sets["median_market_price"],
+                    y=filtered_sets["median_price"],
                     mode="markers+text",
                     marker=dict(
-                        size=filtered_sets["cards_tracked"] / 8 + 4,
+                        size=filtered_sets["total_cards"] / 8 + 4,
                         color=scatter_colors,
                         opacity=0.85,
                         line=dict(width=1, color="#1F2937")
@@ -506,29 +550,53 @@ def main():
                     text=filtered_sets["set_name"],
                     textposition="top center",
                     textfont=dict(size=9, color="#9CA3AF", family="Inter"),
-                    hovertemplate="<b>%{text}</b><br>Lanzamiento: %{x}<br>Precio Mediano: $%{y:.2f}<extra></extra>"
+                    hovertemplate=(
+                        "<b>%{text}</b><br>Lanzamiento: %{x}<br>"
+                        "Mediana: $%{y:.2f}<extra></extra>"
+                    )
                 )
             ]
         )
-        apply_editorial_theme(fig_scatter_time, height=400)
+        apply_editorial_theme(fig_scatter_time, height=390)
         fig_scatter_time.update_layout(yaxis_title="Precio Mediano ($)")
         st.plotly_chart(fig_scatter_time, use_container_width=True, config={"displayModeBar": False})
 
-        st.markdown('<div class="section-heading">Inventario Detallado de Expansiones</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-heading">Top 15 Expansiones por Volatilidad de Precios (Desviación Estándar - Gold)</div>', unsafe_allow_html=True)
+        top_vol_sets = filtered_sets.sort_values("price_stddev", ascending=False).head(15)
+        colors_vol = [COLOR_ACCENT if i == 0 else COLOR_BASE for i in range(len(top_vol_sets))]
+        fig_vol = go.Figure(
+            data=[
+                go.Bar(
+                    x=top_vol_sets["price_stddev"],
+                    y=top_vol_sets["set_name"],
+                    orientation="h",
+                    marker_color=colors_vol,
+                    text=[f"${v:.2f}" for v in top_vol_sets["price_stddev"]],
+                    textposition="outside",
+                    textfont=dict(family="IBM Plex Mono", size=10, color="#E5E7EB")
+                )
+            ]
+        )
+        apply_editorial_theme(fig_vol, height=380)
+        fig_vol.update_layout(yaxis=dict(autorange="reversed"), xaxis_title="Volatilidad (Desviación Estándar $)")
+        st.plotly_chart(fig_vol, use_container_width=True, config={"displayModeBar": False})
+
+        st.markdown('<div class="section-heading">Inventario Detallado de Expansiones (gold_set_summary)</div>', unsafe_allow_html=True)
         display_cols = [
             "set_name", "series", "era_category", "release_date",
-            "cards_tracked", "median_market_price", "avg_market_price",
-            "max_market_price", "avg_spread_pct", "anomaly_count"
+            "total_cards", "median_price", "avg_price",
+            "max_price", "price_stddev", "avg_spread_pct", "anomaly_count"
         ]
         rename_dict = {
             "set_name": "Expansión",
             "series": "Serie",
             "era_category": "Era",
             "release_date": "Fecha Lanzamiento",
-            "cards_tracked": "Cartas",
-            "median_market_price": "Mediana ($)",
-            "avg_market_price": "Promedio ($)",
-            "max_market_price": "Máximo ($)",
+            "total_cards": "Cartas",
+            "median_price": "Mediana ($)",
+            "avg_price": "Promedio ($)",
+            "max_price": "Máximo ($)",
+            "price_stddev": "Volatilidad (Std $)",
             "avg_spread_pct": "Spread (%)",
             "anomaly_count": "Anomalías"
         }
@@ -553,8 +621,8 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        df_anomalies = get_top_anomalies(DEFAULT_DB_PATH, limit=120)
-        df_full = get_full_cards_dataset(DEFAULT_DB_PATH)
+        df_anomalies = cached_top_anomalies(DEFAULT_DB_PATH, limit=120)
+        df_full = cached_full_cards(DEFAULT_DB_PATH, DEFAULT_PARQUET_PATH)
 
         # Gráfico Editorial de Dos Colores: Normal (Gris pizarra #64748B) vs Anomalías (Ámbar editorial #F59E0B)
         df_normal = df_full[~df_full["is_market_anomaly"]]
@@ -653,7 +721,7 @@ def main():
         with col_box:
             st.markdown('<div class="section-heading">Distribución Cuantitativa de Precios por Rareza</div>', unsafe_allow_html=True)
             log_scale = st.checkbox("Escala logarítmica", value=True)
-            df_full = get_full_cards_dataset(DEFAULT_DB_PATH)
+            df_full = cached_full_cards(DEFAULT_DB_PATH, DEFAULT_PARQUET_PATH)
 
             # Boxplot editorial: Gris pizarra limpio
             fig_box = go.Figure()
@@ -679,7 +747,7 @@ def main():
 
         with col_art:
             st.markdown('<div class="section-heading">Top Ilustradores por Precio Mediano (USD)</div>', unsafe_allow_html=True)
-            df_artists = get_top_artists_by_market_value(DEFAULT_DB_PATH, min_cards=5, limit=10)
+            df_artists = cached_top_artists(DEFAULT_DB_PATH, min_cards=5, limit=10)
 
             # Bar horizontal: Gris pizarra con líder en color de acento
             colors_art = [COLOR_ACCENT if i == 0 else COLOR_BASE for i in range(len(df_artists))]
@@ -726,47 +794,50 @@ def main():
     with tab_sql:
         st.markdown('<div class="section-heading">Consola Analítica Vectorizada (DuckDB In-Process)</div>', unsafe_allow_html=True)
 
-        with st.expander("Esquema relacional estrella (DDL)", expanded=False):
+        with st.expander("Esquema Medallion en DuckDB & Parquet (DDL)", expanded=False):
             st.code("""
--- Modelo Dimensional en data/pokemon_market.duckdb
-dim_sets           (set_id PK, set_name, series, release_date, era_category, total_cards_count)
-dim_cards          (card_id PK, name, supertype, subtype, rarity, rarity_group, artist, set_id)
-fact_market_prices (fact_id PK, card_id, market_price, low_price, high_price, price_spread,
-                    price_spread_pct, price_tier, card_age_years, modified_z_score,
-                    is_outlier_iqr, is_outlier_zscore, is_market_anomaly, load_timestamp)
+-- Warehouse en data/warehouse/pokemon_tcg.duckdb + data/processed/cards_clean.parquet
+silver_cards     (card_id PK, name, supertype, subtype, rarity, rarity_group, artist,
+                  set_id, set_name, series, release_date, era_category,
+                  market_price, low_price, high_price, price_spread, price_spread_pct,
+                  price_tier, card_age_years, modified_z_score,
+                  is_outlier_iqr, is_outlier_zscore, is_market_anomaly, snapshot_date, load_timestamp)
+
+gold_set_summary (set_id PK, set_name, series, release_date, era_category,
+                  total_cards, avg_price, median_price, min_price, max_price,
+                  price_stddev, avg_spread_pct, anomaly_count, load_timestamp)
             """, language="sql")
 
         predefined_queries = {
-            "Top 10 cartas Vintage más cotizadas": """
-SELECT c.name, s.set_name, s.era_category, f.market_price, f.modified_z_score
-FROM fact_market_prices f
-JOIN dim_cards c ON f.card_id = c.card_id
-JOIN dim_sets s ON c.set_id = s.set_id
-WHERE s.era_category = 'Vintage'
-ORDER BY f.market_price DESC
+            "Top 10 cartas Vintage más cotizadas (silver_cards)": """
+SELECT name, set_name, era_category, market_price, modified_z_score
+FROM silver_cards
+WHERE era_category = 'Vintage'
+ORDER BY market_price DESC
 LIMIT 10;
 """,
-            "Tasa de anomalías y spreads por serie": """
-SELECT 
-    s.series,
-    COUNT(c.card_id) AS total_cartas,
-    SUM(CASE WHEN f.is_market_anomaly THEN 1 ELSE 0 END) AS anomalias,
-    ROUND(100.0 * SUM(CASE WHEN f.is_market_anomaly THEN 1 ELSE 0 END) / COUNT(c.card_id), 2) AS pct_anomalias,
-    ROUND(AVG(f.price_spread_pct), 2) AS spread_promedio
-FROM dim_sets s
-JOIN dim_cards c ON s.set_id = c.set_id
-JOIN fact_market_prices f ON c.card_id = f.card_id
-GROUP BY s.series
-ORDER BY pct_anomalias DESC;
+            "Top expansiones por volatilidad y mediana (gold_set_summary)": """
+SELECT
+    set_name,
+    series,
+    era_category,
+    total_cards,
+    median_price,
+    avg_price,
+    max_price,
+    price_stddev
+FROM gold_set_summary
+ORDER BY price_stddev DESC
+LIMIT 15;
 """,
-            "Agregaciones por escalón de precio": """
-SELECT 
+            "Agregaciones por escalón de precio (silver_cards)": """
+SELECT
     price_tier,
     COUNT(*) AS total_cartas,
     ROUND(MIN(market_price), 2) AS min_precio,
     ROUND(MEDIAN(market_price), 2) AS mediana_precio,
     ROUND(MAX(market_price), 2) AS max_precio
-FROM fact_market_prices
+FROM silver_cards
 GROUP BY price_tier
 ORDER BY mediana_precio DESC;
 """

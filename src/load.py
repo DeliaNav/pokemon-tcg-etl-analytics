@@ -1,18 +1,17 @@
 """
-Módulo de Carga para el pipeline ETL de Pokémon TCG.
+Módulo de Carga (Capas Silver & Gold) para el pipeline ETL de Pokémon TCG.
 
-Implementa un Esquema Estrella (Star Schema) en DuckDB:
-- Tabla Dimensional: dim_sets (Metadatos del set, serie, fecha de lanzamiento, era).
-- Tabla Dimensional: dim_cards (Identidad de la carta, supertipo, subtipo, rareza, artista).
-- Tabla de Hechos: fact_market_prices (Métricas monetarias, spreads, anomalías estadísticas, timestamp).
-
-Garantiza inserción 100% idempotente mediante transacciones atómicas y
-estrategia de upsert (ON CONFLICT DO UPDATE).
+Persiste el Data Warehouse en DuckDB (`data/warehouse/pokemon_tcg.duckdb`) y exporta
+la capa Silver en formato columnar Parquet (`data/processed/cards_clean.parquet`):
+- Capa Silver (`silver_cards`): Datos limpios, fechas normalizadas, precios DOUBLE,
+  features analíticas y banderas de anomalías estadísticas (deduplicados por carta/snapshot).
+- Capa Gold (`gold_set_summary`): Agregación por expansión/set con total de cartas,
+  precio medio, mediana, mínimo, máximo, volatilidad (desviación estándar) y anomalías.
 """
 
 import os
 import logging
-from typing import Optional
+from typing import Dict
 import duckdb
 import pandas as pd
 
@@ -20,37 +19,22 @@ import pandas as pd
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] [LOAD]: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "data/pokemon_market.duckdb"
+DEFAULT_DB_PATH = "data/warehouse/pokemon_tcg.duckdb"
+DEFAULT_PARQUET_PATH = "data/processed/cards_clean.parquet"
 
 
-def init_star_schema(conn: duckdb.DuckDBPyConnection) -> None:
+def init_medallion_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """
-    Crea las tablas dimensionales y la tabla de hechos del esquema estrella en DuckDB.
-    En DuckDB (motor OLAP columnar de alto rendimiento), las relaciones dimensionales
-    se modelan con PRIMARY KEYs e índices lógicos en las claves foráneas para maximizar
-    el rendimiento vectorial en joins y garantizar upserts transaccionales idempotentes.
+    Inicializa las tablas de la arquitectura Medallion (Silver y Gold) en DuckDB.
     """
-    logger.info("Inicializando DDL del Esquema Estrella en DuckDB...")
+    logger.info("Inicializando DDL de Capas Silver y Gold en DuckDB...")
 
-    # 1. Dimensión de Sets
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS dim_sets (
-        set_id VARCHAR PRIMARY KEY,
-        set_name VARCHAR NOT NULL,
-        series VARCHAR NOT NULL,
-        release_date DATE NOT NULL,
-        era_category VARCHAR NOT NULL,
-        total_cards_count INTEGER NOT NULL
-    );
-    """)
-
-    # 2. Dimensión de Cartas
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS dim_cards (
+    CREATE TABLE IF NOT EXISTS silver_cards (
         card_id VARCHAR PRIMARY KEY,
         name VARCHAR NOT NULL,
         supertype VARCHAR NOT NULL,
@@ -58,15 +42,11 @@ def init_star_schema(conn: duckdb.DuckDBPyConnection) -> None:
         rarity VARCHAR NOT NULL,
         rarity_group VARCHAR NOT NULL,
         artist VARCHAR,
-        set_id VARCHAR NOT NULL
-    );
-    """)
-
-    # 3. Tabla de Hechos de Precios de Mercado
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS fact_market_prices (
-        fact_id VARCHAR PRIMARY KEY,
-        card_id VARCHAR NOT NULL,
+        set_id VARCHAR NOT NULL,
+        set_name VARCHAR NOT NULL,
+        series VARCHAR NOT NULL,
+        release_date DATE NOT NULL,
+        era_category VARCHAR NOT NULL,
         market_price DOUBLE NOT NULL,
         low_price DOUBLE NOT NULL,
         high_price DOUBLE NOT NULL,
@@ -78,81 +58,72 @@ def init_star_schema(conn: duckdb.DuckDBPyConnection) -> None:
         is_outlier_iqr BOOLEAN NOT NULL,
         is_outlier_zscore BOOLEAN NOT NULL,
         is_market_anomaly BOOLEAN NOT NULL,
+        snapshot_date DATE NOT NULL,
         load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    logger.info("Esquema estrella inicializado correctamente (dim_sets, dim_cards, fact_market_prices).")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS gold_set_summary (
+        set_id VARCHAR PRIMARY KEY,
+        set_name VARCHAR NOT NULL,
+        series VARCHAR NOT NULL,
+        release_date DATE NOT NULL,
+        era_category VARCHAR NOT NULL,
+        total_cards INTEGER NOT NULL,
+        avg_price DOUBLE NOT NULL,
+        median_price DOUBLE NOT NULL,
+        min_price DOUBLE NOT NULL,
+        max_price DOUBLE NOT NULL,
+        price_stddev DOUBLE NOT NULL,
+        avg_spread_pct DOUBLE NOT NULL,
+        anomaly_count INTEGER NOT NULL,
+        load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    logger.info("Esquema Medallion inicializado correctamente (silver_cards, gold_set_summary).")
 
 
-def load_to_duckdb(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> dict:
+def load_to_duckdb(
+    df: pd.DataFrame,
+    db_path: str = DEFAULT_DB_PATH,
+    parquet_path: str = DEFAULT_PARQUET_PATH,
+) -> Dict[str, int]:
     """
-    Carga el DataFrame transformado en las tablas del esquema estrella de DuckDB
-    de forma transaccional e idempotente.
-
-    Args:
-        df: DataFrame procesado por el módulo transform.
-        db_path: Ruta al archivo DuckDB.
-
-    Returns:
-        Diccionario con conteos de registros cargados en cada tabla.
+    Carga el DataFrame transformado en `silver_cards` (DuckDB), lo exporta a Parquet
+    (`data/processed/cards_clean.parquet`) y construye la tabla agregada `gold_set_summary`.
+    Garantiza idempotencia mediante transacciones atómicas y upserts / reemplazo controlado.
     """
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    logger.info(f"Conectando a base de datos DuckDB: {db_path}...")
+    os.makedirs(os.path.dirname(parquet_path) or ".", exist_ok=True)
 
+    logger.info(f"Conectando a DuckDB Warehouse: '{db_path}'...")
     conn = duckdb.connect(database=db_path, read_only=False)
 
     try:
-        # Iniciar transacción
         conn.begin()
+        init_medallion_schema(conn)
 
-        # Asegurar esquema
-        init_star_schema(conn)
+        # Preparar columnas de staging para silver_cards
+        silver_cols = [
+            "card_id", "name", "supertype", "subtype", "rarity", "rarity_group", "artist",
+            "set_id", "set_name", "series", "release_date", "era_category",
+            "market_price", "low_price", "high_price", "price_spread", "price_spread_pct",
+            "price_tier", "card_age_years", "modified_z_score",
+            "is_outlier_iqr", "is_outlier_zscore", "is_market_anomaly", "snapshot_date"
+        ]
+        df_silver = df[silver_cols].drop_duplicates(subset=["card_id"], keep="last").copy()
 
-        # -------------------------------------------------------------
-        # 1. Preparar y cargar DIM_SETS
-        # -------------------------------------------------------------
-        set_counts = df.groupby("set_id").size().to_dict()
-        df_sets = (
-            df[["set_id", "set_name", "series", "release_date", "era_category"]]
-            .drop_duplicates(subset=["set_id"])
-            .copy()
-        )
-        df_sets["total_cards_count"] = df_sets["set_id"].map(set_counts).fillna(0).astype(int)
-
-        # Carga idempotente en dim_sets
-        conn.register("staging_sets", df_sets)
+        conn.register("staging_silver", df_silver)
         conn.execute("""
-        INSERT INTO dim_sets
-        SELECT 
-            set_id,
-            set_name,
-            series,
-            CAST(release_date AS DATE),
-            era_category,
-            total_cards_count
-        FROM staging_sets
-        ON CONFLICT (set_id) DO UPDATE SET
-            set_name = EXCLUDED.set_name,
-            series = EXCLUDED.series,
-            release_date = EXCLUDED.release_date,
-            era_category = EXCLUDED.era_category,
-            total_cards_count = EXCLUDED.total_cards_count;
-        """)
-        conn.unregister("staging_sets")
-
-        # -------------------------------------------------------------
-        # 2. Preparar y cargar DIM_CARDS
-        # -------------------------------------------------------------
-        df_cards = (
-            df[["card_id", "name", "supertype", "subtype", "rarity", "rarity_group", "artist", "set_id"]]
-            .drop_duplicates(subset=["card_id"])
-            .copy()
+        INSERT INTO silver_cards (
+            card_id, name, supertype, subtype, rarity, rarity_group, artist,
+            set_id, set_name, series, release_date, era_category,
+            market_price, low_price, high_price, price_spread, price_spread_pct,
+            price_tier, card_age_years, modified_z_score,
+            is_outlier_iqr, is_outlier_zscore, is_market_anomaly, snapshot_date, load_timestamp
         )
-
-        conn.register("staging_cards", df_cards)
-        conn.execute("""
-        INSERT INTO dim_cards
-        SELECT 
+        SELECT
             card_id,
             name,
             supertype,
@@ -160,8 +131,25 @@ def load_to_duckdb(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> dict:
             rarity,
             rarity_group,
             artist,
-            set_id
-        FROM staging_cards
+            set_id,
+            set_name,
+            series,
+            CAST(release_date AS DATE),
+            era_category,
+            CAST(market_price AS DOUBLE),
+            CAST(low_price AS DOUBLE),
+            CAST(high_price AS DOUBLE),
+            CAST(price_spread AS DOUBLE),
+            CAST(price_spread_pct AS DOUBLE),
+            price_tier,
+            CAST(card_age_years AS DOUBLE),
+            CAST(modified_z_score AS DOUBLE),
+            CAST(is_outlier_iqr AS BOOLEAN),
+            CAST(is_outlier_zscore AS BOOLEAN),
+            CAST(is_market_anomaly AS BOOLEAN),
+            CAST(snapshot_date AS DATE),
+            now()
+        FROM staging_silver
         ON CONFLICT (card_id) DO UPDATE SET
             name = EXCLUDED.name,
             supertype = EXCLUDED.supertype,
@@ -169,57 +157,11 @@ def load_to_duckdb(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> dict:
             rarity = EXCLUDED.rarity,
             rarity_group = EXCLUDED.rarity_group,
             artist = EXCLUDED.artist,
-            set_id = EXCLUDED.set_id;
-        """)
-        conn.unregister("staging_cards")
-
-        # -------------------------------------------------------------
-        # 3. Preparar y cargar FACT_MARKET_PRICES
-        # -------------------------------------------------------------
-        df_facts = df[[
-            "card_id", "market_price", "low_price", "high_price",
-            "price_spread", "price_spread_pct", "price_tier", "card_age_years",
-            "modified_z_score", "is_outlier_iqr", "is_outlier_zscore", "is_market_anomaly"
-        ]].copy()
-        
-        # Generar clave primaria unívoca fact_id (idempotente vinculada a card_id)
-        df_facts["fact_id"] = df_facts["card_id"]
-
-        conn.register("staging_facts", df_facts)
-        conn.execute("""
-        INSERT INTO fact_market_prices (
-            fact_id,
-            card_id,
-            market_price,
-            low_price,
-            high_price,
-            price_spread,
-            price_spread_pct,
-            price_tier,
-            card_age_years,
-            modified_z_score,
-            is_outlier_iqr,
-            is_outlier_zscore,
-            is_market_anomaly,
-            load_timestamp
-        )
-        SELECT 
-            fact_id,
-            card_id,
-            market_price,
-            low_price,
-            high_price,
-            price_spread,
-            price_spread_pct,
-            price_tier,
-            card_age_years,
-            modified_z_score,
-            is_outlier_iqr,
-            is_outlier_zscore,
-            is_market_anomaly,
-            now()
-        FROM staging_facts
-        ON CONFLICT (fact_id) DO UPDATE SET
+            set_id = EXCLUDED.set_id,
+            set_name = EXCLUDED.set_name,
+            series = EXCLUDED.series,
+            release_date = EXCLUDED.release_date,
+            era_category = EXCLUDED.era_category,
             market_price = EXCLUDED.market_price,
             low_price = EXCLUDED.low_price,
             high_price = EXCLUDED.high_price,
@@ -231,29 +173,57 @@ def load_to_duckdb(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> dict:
             is_outlier_iqr = EXCLUDED.is_outlier_iqr,
             is_outlier_zscore = EXCLUDED.is_outlier_zscore,
             is_market_anomaly = EXCLUDED.is_market_anomaly,
+            snapshot_date = EXCLUDED.snapshot_date,
             load_timestamp = now();
         """)
-        conn.unregister("staging_facts")
+        conn.unregister("staging_silver")
 
-        # Confirmar transacción
+        # Construcción de Capa Gold: Agregación por expansión/set
+        conn.execute("DELETE FROM gold_set_summary;")
+        conn.execute("""
+        INSERT INTO gold_set_summary (
+            set_id, set_name, series, release_date, era_category,
+            total_cards, avg_price, median_price, min_price, max_price,
+            price_stddev, avg_spread_pct, anomaly_count, load_timestamp
+        )
+        SELECT
+            set_id,
+            ANY_VALUE(set_name) AS set_name,
+            ANY_VALUE(series) AS series,
+            MIN(release_date) AS release_date,
+            ANY_VALUE(era_category) AS era_category,
+            COUNT(*)::INTEGER AS total_cards,
+            ROUND(AVG(market_price), 2) AS avg_price,
+            ROUND(MEDIAN(market_price), 2) AS median_price,
+            ROUND(MIN(market_price), 2) AS min_price,
+            ROUND(MAX(market_price), 2) AS max_price,
+            ROUND(COALESCE(STDDEV_SAMP(market_price), 0.0), 2) AS price_stddev,
+            ROUND(AVG(price_spread_pct), 2) AS avg_spread_pct,
+            SUM(CASE WHEN is_market_anomaly THEN 1 ELSE 0 END)::INTEGER AS anomaly_count,
+            now()
+        FROM silver_cards
+        GROUP BY set_id;
+        """)
+
+        # Exportación columnar Parquet de silver_cards
+        parquet_sql_path = parquet_path.replace("\\", "/")
+        conn.execute(f"COPY silver_cards TO '{parquet_sql_path}' (FORMAT PARQUET, COMPRESSION ZSTD);")
+
         conn.commit()
 
-        # Verificación y conteos
-        count_sets = conn.execute("SELECT COUNT(*) FROM dim_sets;").fetchone()[0]
-        count_cards = conn.execute("SELECT COUNT(*) FROM dim_cards;").fetchone()[0]
-        count_facts = conn.execute("SELECT COUNT(*) FROM fact_market_prices;").fetchone()[0]
+        count_silver = conn.execute("SELECT COUNT(*) FROM silver_cards;").fetchone()[0]
+        count_gold = conn.execute("SELECT COUNT(*) FROM gold_set_summary;").fetchone()[0]
 
         summary = {
-            "dim_sets": count_sets,
-            "dim_cards": count_cards,
-            "fact_market_prices": count_facts
+            "silver_cards": int(count_silver),
+            "gold_set_summary": int(count_gold),
         }
-        logger.info(f"Carga en DuckDB completada exitosamente. Registros: {summary}")
+        logger.info(f"Carga Medallion completada. DuckDB: {summary} | Parquet exportado en '{parquet_path}'.")
         return summary
 
     except Exception as ex:
         conn.rollback()
-        logger.error(f"Error crítico durante la carga en DuckDB: {ex}")
+        logger.error(f"Error crítico durante la carga en DuckDB/Parquet: {ex}")
         raise ex
     finally:
         conn.close()
