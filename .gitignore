@@ -1,0 +1,36 @@
+# Entornos virtuales
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache y compilados
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.pytest_cache/
+
+# DuckDB archivos temporales y bloqueos (ignoramos el WAL si se crea temporalmente)
+*.duckdb.wal
+*.duckdb.tmp
+
+# Datos crudos grandes descargados manualmente (opcional si son muy pesados)
+# data/raw/*.csv
+# data/raw/*.zip
+
+# Logs del sistema y checkpoints
+logs/
+*.log
+.ipynb_checkpoints/
+
+# IDE y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SO
+.DS_Store
+Thumbs.db
